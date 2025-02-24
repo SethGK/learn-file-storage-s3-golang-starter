@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -75,19 +76,27 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	defer tempFile.Close()
-	defer os.Remove(tempFile.Name())
 
 	if _, err = io.Copy(tempFile, file); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error saving temporary file", err)
 		return
 	}
 
-	if _, err = tempFile.Seek(0, io.SeekStart); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Error resetting file pointer", err)
+	processedFilePath, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error processing video for fast start", err)
 		return
 	}
+	defer os.Remove(processedFilePath)
 
-	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	processedFile, err := os.Open(processedFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error opening processed file", err)
+		return
+	}
+	defer processedFile.Close()
+
+	aspectRatio, err := getVideoAspectRatio(processedFilePath)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error determining aspect ratio", err)
 		return
@@ -111,7 +120,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	putInput := &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &fileKey,
-		Body:        tempFile,
+		Body:        processedFile,
 		ContentType: &ct,
 	}
 	_, err = cfg.s3Client.PutObject(context.Background(), putInput)
@@ -128,4 +137,19 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outputFilePath := filePath + ".processing"
+
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputFilePath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("error processing video for fast start: %w", err)
+	}
+
+	return outputFilePath, nil
 }
